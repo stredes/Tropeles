@@ -1,106 +1,241 @@
+# tropeles_game/entities/tropel.py
+
+import math
 import random
-from entities.resource   import Resource
-from entities.technology import Technology
+from pygame.math import Vector2
 
-class World:
-    """Genera terreno, recursos persistentes y tecnologías."""
-    def __init__(self, config):
-        self.config      = config
-        self.width, self.height = config["world_size"]
-        self.tile_size   = config["tile_size"]
-        self.grid_w      = self.width  // self.tile_size
-        self.grid_h      = self.height // self.tile_size
+from entities.resource      import Resource
+from entities.technology    import Technology
+from ai.ollama_client       import query
 
-        self.water_tiles = set()
-        self.trees       = []
-        self.ore_veins   = []
+class Tropel:
+    """
+    Tropel corregido: IA, supervivencia, agricultura, caza, construcción y reproducción.
+    """
+    REPRO_THRESHOLD = 95      # umbral para dividir
+    REPRO_COOLDOWN  = 60000   # ms entre reproducciones
 
-        self.resources   = []
-        self.tropeles    = []
-        self.techs       = []
+    def __init__(self, world, ai_client=query):
+        self.world        = world
+        self.ai           = ai_client
+        cfg               = world.config
 
-        self._generate_water(config["water_areas"])
-        self._generate_trees(config["tree_count"])
-        self._generate_ore_veins(config["ore_vein_count"])
+        # Posición y movimiento
+        cx, cy            = world.width//2, world.height//2
+        self.pos         = Vector2(cx, cy)
+        self.speed       = cfg["tropel_speed"]
 
-        for name, info in config["technologies"].items():
-            self.techs.append(
-                Technology(name, info["requirements"], info["prereqs"])
-            )
+        # Estados fisiológicos
+        self.hunger      = 100.0
+        self.thirst      = 100.0
+        self.health      = 100.0
+        self.alive       = True
 
-        self.spawn_timers = {k: 0 for k in config["resource_spawn_intervals"]}
+        # Comunicación / detección
+        self.comm_radius = cfg["communication_radius"]
 
-    def _generate_water(self, count):
-        for _ in range(count):
-            x0 = random.randint(0, self.grid_w - 5)
-            y0 = random.randint(0, self.grid_h - 5)
-            w, h = random.randint(3,7), random.randint(3,7)
-            for i in range(x0, x0 + w):
-                for j in range(y0, y0 + h):
-                    self.water_tiles.add((i, j))
+        # Inventario y tecnologías
+        self.inventory   = {k: 0 for k in cfg["resource_spawn_intervals"].keys()}
+        self.known_tech  = set()
 
-    def _generate_trees(self, count):
-        for _ in range(count):
-            while True:
-                i, j = random.randint(0, self.grid_w-1), random.randint(0,self.grid_h-1)
-                if (i,j) not in self.water_tiles:
-                    self.trees.append((i, j))
-                    break
+        # Construcción y estructuras
+        self.structures  = {}    # e.g. {"House": 1}
+        self.tools_code  = {}    # e.g. {"House": "<class House...>"}
 
-    def _generate_ore_veins(self, count):
-        for _ in range(count):
-            i, j = random.randint(0,self.grid_w-1), random.randint(0,self.grid_h-1)
-            self.ore_veins.append((i, j))
+        # Timers (ms)
+        self.advice_timer = cfg["advice_interval"]
+        self.repro_timer  = 0
+        self.agri_timer   = cfg.get("agriculture_interval", 0)
+        self.farm_timer   = cfg.get("farm_interval", 0)
+        self.house_timer  = cfg.get("house_interval", 0)
 
-    def add_tropel(self, tropel):
-        self.tropeles.append(tropel)
+    def _find_nearest_water(self):
+        best = min(
+            self.world.water_tiles,
+            key=lambda t: (self.pos.x/self.world.tile_size - t[0])**2
+                        + (self.pos.y/self.world.tile_size - t[1])**2
+        )
+        x = best[0]*self.world.tile_size + self.world.tile_size//2
+        y = best[1]*self.world.tile_size + self.world.tile_size//2
+        return Vector2(x, y)
+
+    def _find_nearest_resource(self, resources):
+        res = min(resources, key=lambda r: self.pos.distance_to(r.position))
+        return Vector2(res.position)
+
+    def think(self):
+        cfg = self.world.config
+
+        # 1) Beber si sed > hambre
+        if self.thirst < self.hunger and self.world.water_tiles:
+            return self._find_nearest_water()
+
+        # 2) Comer si hambre <50
+        if self.hunger < 50:
+            foods = [r for r in self.world.resources if r.kind in ("food","crop","meat")]
+            if foods:
+                return self._find_nearest_resource(foods)
+
+        # 3) Cazar si poca carne
+        if self.inventory.get("meat",0) < 2 and self.world.animals:
+            nearest = min(self.world.animals, key=lambda a: self.pos.distance_to(a.pos))
+            return Vector2(nearest.pos)
+
+        # 4) Recolectar otros recursos básicos
+        for kind in ("wood","stone","metal","ore"):
+            if self.inventory.get(kind,0) < 5:
+                res = [r for r in self.world.resources if r.kind == kind]
+                if res:
+                    return self._find_nearest_resource(res)
+
+        # 5) Investigar tecnología si puede
+        for tech in self.world.techs:
+            if tech.name not in self.known_tech and tech.can_research(self):
+                return None
+
+        # 6) Agricultura: plantar árbol
+        if "Agriculture" in self.known_tech and self.agri_timer == 0 and self.inventory["food"] >= 5:
+            return None
+
+        # 7) Construir granja
+        if "Agriculture" in self.known_tech and self.farm_timer == 0 and self.inventory["wood"] >= 10:
+            return None
+
+        # 8) Construir casa
+        if self.house_timer == 0 and self.inventory["wood"] >= 10 and self.inventory["stone"] >= 5:
+            return None
+
+        # 9) Deambular
+        return None
 
     def update(self, dt):
-        # 1) Generar recursos
-        for kind, interval in self.config["resource_spawn_intervals"].items():
-            self.spawn_timers[kind] += dt
-            if self.spawn_timers[kind] >= interval:
-                self.spawn_timers[kind] %= interval
-                self._spawn_resource(kind)
+        cfg = self.world.config
+        if not self.alive:
+            return None
 
-        # 2) Actualizar recursos (ttl) y tropeles
-        self.resources = [
-            r for r in self.resources if r.update(dt)
-        ]
+        # 1) Reducir timers
+        self.repro_timer  = max(0, self.repro_timer  - dt)
+        self.advice_timer = max(0, self.advice_timer - dt)
+        self.agri_timer   = max(0, self.agri_timer   - dt)
+        self.farm_timer   = max(0, self.farm_timer   - dt)
+        self.house_timer  = max(0, self.house_timer  - dt)
 
-        new_borns = []
-        for t in list(self.tropeles):
-            child = t.update(dt)
-            if child:
-                new_borns.append(child)
-        for c in new_borns:
-            self.add_tropel(c)
+        # 2) Hambre / sed (clamp >=0)
+        self.hunger = max(0.0, self.hunger - cfg["hunger_rate"] * dt)
+        self.thirst = max(0.0, self.thirst - cfg["thirst_rate"] * dt)
 
-        # 3) Filtrar tropeles muertos
-        self.tropeles = [t for t in self.tropeles if t.alive]
+        # 3) Beber al pisar agua
+        tx = int(self.pos.x // cfg["tile_size"])
+        ty = int(self.pos.y // cfg["tile_size"])
+        if (tx,ty) in self.world.water_tiles:
+            self.thirst = min(100.0, self.thirst + cfg["thirst_gain"] * (dt/1000))
 
-    def _spawn_resource(self, kind):
-        ttl = None
-        if kind == "food":
-            ttl = self.config["food_ttl"]
-        if kind == "food":
-            for (i,j) in self.trees:
-                if random.random() < 0.5:
-                    x = i*self.tile_size + self.tile_size//2
-                    y = j*self.tile_size + self.tile_size//2
-                    self.resources.append(Resource("food", (x,y), amount=1, ttl=ttl))
-        elif kind == "wood":
-            i,j = random.choice(self.trees)
-            x = i*self.tile_size + random.randint(-5,5)
-            y = j*self.tile_size + random.randint(-5,5)
-            self.resources.append(Resource("wood",(x,y),1))
-        elif kind == "stone":
-            i,j = random.choice(self.ore_veins)
-            x = i*self.tile_size + random.randint(-8,8)
-            y = j*self.tile_size + random.randint(-8,8)
-            self.resources.append(Resource("stone",(x,y),1))
-        elif kind == "metal":
-            i,j = random.choice(self.ore_veins)
-            x = i*self.tile_size + random.randint(-8,8)
-            y = j*self.tile_size + random.randint(-8,8)
-            self.resources.append(Resource("metal",(x,y),1))
+        # 4) Recolectar y comer
+        for r in list(self.world.resources):
+            if self.pos.distance_to(r.position) < r.radius + 4:
+                self.inventory[r.kind] = self.inventory.get(r.kind,0) + r.amount
+                if r.kind in ("food","crop"):
+                    self.hunger = min(100.0, self.hunger + cfg["hunger_gain"])
+                elif r.kind == "meat":
+                    self.hunger = min(100.0, self.hunger + cfg["meat_gain"])
+                self.world.resources.remove(r)
+                break
+
+        # 5) Cazar animales
+        for a in list(self.world.animals):
+            if self.pos.distance_to(a.pos) < 8:
+                self.inventory["meat"] = self.inventory.get("meat",0) + 1
+                self.hunger = min(100.0, self.hunger + cfg["meat_gain"])
+                self.world.animals.remove(a)
+                break
+
+        # 6) Investigación
+        for tech in self.world.techs:
+            if tech.name not in self.known_tech and tech.research(self):
+                self.speed += cfg.get("tech_speed_bonus",0)
+                break
+
+        # 7) Plantar árbol
+        if "Agriculture" in self.known_tech and self.agri_timer == 0 and self.inventory["food"] >= 5:
+            tile = random.choice(list(self.world.water_tiles))
+            self.world._generate_trees(1)  # añade un árbol nuevo
+            self.inventory["food"] -= 5
+            self.agri_timer = cfg["agriculture_interval"]
+
+        # 8) Crear granja
+        if "Agriculture" in self.known_tech and self.farm_timer == 0 and self.inventory["wood"] >= 10:
+            self.world._generate_farmland(1)
+            self.inventory["wood"] -= 10
+            self.farm_timer = cfg["farm_interval"]
+
+        # 9) Construir casa
+        if self.house_timer == 0 and self.inventory["wood"] >= 10 and self.inventory["stone"] >= 5:
+            pos = (int(self.pos.x//cfg["tile_size"]), int(self.pos.y//cfg["tile_size"]))
+            self.world.structures.append(("House", pos))
+            self.inventory["wood"]  -= 10
+            self.inventory["stone"] -= 5
+            self.house_timer = cfg["house_interval"]
+
+        # 10) Salud decae si hambre/sed 0
+        if self.hunger == 0 or self.thirst == 0:
+            self.health = max(0.0, self.health - cfg["health_decay_rate"] * dt)
+        if self.health == 0.0:
+            self.alive = False
+            return None
+
+        # 11) IA interna
+        if self.advice_timer == 0:
+            self.advice_timer = cfg["advice_interval"]
+            prompt = f"h={self.hunger:.1f},t={self.thirst:.1f},hl={self.health:.1f}. sugerencias:valor;..."
+            advice = self.ai(prompt) or ""
+            for part in advice.split(";"):
+                if ":" in part:
+                    k,v = part.split(":",1)
+                    try: setattr(self, k.strip(), float(v))
+                    except: pass
+
+        # 12) Movimiento
+        target = self.think()
+        if target:
+            direction = (target - self.pos).normalize()
+        else:
+            angle     = random.uniform(0, 2*math.pi)
+            direction = Vector2(math.cos(angle), math.sin(angle))
+        self.pos += direction * self.speed * (dt/1000)
+        self.pos.x = max(0, min(self.world.width,  self.pos.x))
+        self.pos.y = max(0, min(self.world.height, self.pos.y))
+
+        # 13) Reproducción
+        if (self.hunger >= Tropel.REPRO_THRESHOLD
+            and self.thirst >= Tropel.REPRO_THRESHOLD
+            and self.repro_timer == 0
+            and len(self.world.tropeles) < cfg["max_tropeles"]):
+            child = self.reproduce()
+            self.repro_timer = Tropel.REPRO_COOLDOWN
+            return child
+
+        return None
+
+    def reproduce(self):
+        """Clona su estado para un nuevo Tropel cercano."""
+        offset = Vector2(random.randint(-20,20), random.randint(-20,20))
+        child = Tropel(self.world, self.ai)
+        child.pos        = self.pos + offset
+        child.speed      = self.speed
+        child.hunger     = self.hunger
+        child.thirst     = self.thirst
+        child.health     = self.health
+        child.inventory  = dict(self.inventory)
+        child.known_tech = set(self.known_tech)
+        child.structures = dict(self.structures)
+        child.tools_code = dict(self.tools_code)
+        child.advice_timer = self.advice_timer
+        child.repro_timer  = self.repro_timer
+        child.agri_timer   = self.agri_timer
+        child.farm_timer   = self.farm_timer
+        child.house_timer  = self.house_timer
+
+        # Reducir bienestar del padre
+        self.hunger = max(0.0, self.hunger - 20)
+        self.thirst = max(0.0, self.thirst - 20)
+        return child

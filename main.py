@@ -2,7 +2,6 @@
 
 import resource
 import pygame
-import random
 
 from utils.persistence import Persistence
 from configs.settings   import SETTINGS
@@ -14,13 +13,14 @@ from ui.menu            import Menu
 from ui.control_panel   import ControlPanel
 from ui.inventory_panel import InventoryPanel
 from ui.tech_panel      import TechPanel
+from core.camera        import Camera
+from ui.minimap         import Minimap
 
-# --- Limitar memoria virtual para prevenir OOM killer ---
+# Limitar memoria virtual para prevenir OOM killer
 LIMIT = 500 * 1024 * 1024
 resource.setrlimit(resource.RLIMIT_AS, (LIMIT, LIMIT))
 
 def ask_questions():
-    """Pregunta al usuario al inicio y almacena respuestas en JSON."""
     p = Persistence("questions.json")
     qs = [
         "¿Cómo quieres llamar a tu mundo?",
@@ -37,11 +37,12 @@ def main():
     ask_questions()
 
     pygame.init()
-    screen = pygame.display.set_mode(SETTINGS["world_size"], vsync=1)
+    info = pygame.display.Info()
+    screen_w, screen_h = info.current_w, info.current_h
+    screen = pygame.display.set_mode((screen_w, screen_h), pygame.RESIZABLE)
     pygame.display.set_caption("Tropeles Survival")
-    font   = pygame.font.SysFont(None, 24)
+    font = pygame.font.SysFont(None, 24)
 
-    # Crear mundo y tropeles
     world = World(SETTINGS)
     for _ in range(SETTINGS["initial_tropeles"]):
         world.add_tropel(Tropel(world))
@@ -51,36 +52,54 @@ def main():
     cpanel  = ControlPanel(screen, font)
     ipanel  = InventoryPanel(screen, font)
     tpanel  = TechPanel(screen, world, font)
+    camera  = Camera(world.width, world.height, screen_w, screen_h)
+    minimap = Minimap(screen, world, camera)
     panels  = [cpanel, ipanel, tpanel]
+    renderer= Renderer(screen, world, world.tropeles, panels, camera)
 
-    renderer = Renderer(screen, world, world.tropeles, panels)
-
-    selected   = None
-    running    = True
-    in_menu    = False
-    clock      = pygame.time.Clock()
+    running, in_menu = True, False
+    clock = pygame.time.Clock()
 
     while running:
-        dt, click = clock.tick(60), None
+        dt = clock.tick(60)
+
+        # Procesar eventos de ventana
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.VIDEORESIZE:
+                screen_w, screen_h = event.w, event.h
+                screen = pygame.display.set_mode((screen_w, screen_h), pygame.RESIZABLE)
+                camera.view_w, camera.view_h = screen_w, screen_h
+                minimap = Minimap(screen, world, camera)
+            else:
+                handler.process_event(event)
+
+        # Pan con flechas
+        keys = pygame.key.get_pressed()
+        pan_sp = 300 * (dt/1000)
+        if keys[pygame.K_LEFT]:  camera.move(-pan_sp, 0)
+        if keys[pygame.K_RIGHT]: camera.move( pan_sp, 0)
+        if keys[pygame.K_UP]:    camera.move(0, -pan_sp)
+        if keys[pygame.K_DOWN]:  camera.move(0,  pan_sp)
+
         ok, click = handler.get_events()
         if not ok:
             break
 
-        # Selección de tropel si clicas sobre uno
+        # Selección de tropel
         if click:
             sel = next(
-                (t for t in world.tropeles
-                 if t.alive and t.pos.distance_to(click) < 6),
+                (t for t in world.tropeles if t.alive and t.pos.distance_to(click) < 6),
                 None
             )
-            selected           = sel
-            cpanel.selected    = sel
-            ipanel.selected    = sel
-            tpanel.selected    = sel
+            cpanel.selected = sel
+            ipanel.selected = sel
+            tpanel.selected = sel
 
-        # Paneles reaccionan al clic
         cpanel.handle(click)
         tpanel.handle(click)
+        minimap.handle(click)
 
         if in_menu:
             choice = menu.handle(click)
@@ -90,15 +109,11 @@ def main():
             elif choice == "Quit":
                 break
         else:
-            # Actualiza lógica de mundo y tropeles
             world.update(dt)
-
-            # Si ya no quedan tropeles, pasa a menú
             if not world.tropeles:
                 in_menu = True
-
-            # Dibuja todo
             renderer.draw()
+            minimap.draw()
 
     pygame.quit()
 
